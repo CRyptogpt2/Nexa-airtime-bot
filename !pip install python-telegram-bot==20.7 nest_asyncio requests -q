@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = "8801665645:AAF9b_k_atpDWwZjuwNi8tx7WLLYH-xD9ME"
+BOT_TOKEN = 
 ADMIN_ID = 6326301165
 
 TELEGRAM_CHANNEL_USERNAME = "@nexarion11news"
