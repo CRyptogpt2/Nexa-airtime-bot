@@ -1,0 +1,598 @@
+import sqlite3
+import logging
+import requests
+import nest_asyncio
+import asyncio
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, filters, ContextTypes
+)
+
+nest_asyncio.apply()
+logging.basicConfig(level=logging.INFO)
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BOT_TOKEN = "8801665645:AAF9b_k_atpDWwZjuwNi8tx7WLLYH-xD9ME"
+ADMIN_ID = 6326301165
+
+TELEGRAM_CHANNEL_USERNAME = "@nexarion11news"
+TELEGRAM_CHANNEL_ID = "@nexarion11news"
+TWITTER_ACCOUNT = "@NexarionBot"
+
+VTU_API_URL = "https://cheapestdata.com/api/gsubz/webhook"
+VTU_API_KEY = "ap_d4fb558fd4919e9baa343fab89b1804c"
+
+DATABASE_PATH = "nexarion_bot.db"
+
+POINTS_JOIN_CHANNEL   = 20
+POINTS_REFERRAL       = 50
+POINTS_TWITTER_FOLLOW = 10
+POINTS_TWITTER_LIKE   = 10
+POINTS_TWITTER_RT     = 15
+
+# Airtime plans: points -> naira amount
+AIRTIME_PLANS = {
+    "300": 1000,
+    "500": 1667,
+    "1000": 3334,
+}
+
+NETWORKS = ["MTN", "Airtel"]
+
+(
+    SELECT_NETWORK, SELECT_AMOUNT, ENTER_PHONE, CONFIRM_WITHDRAWAL,
+    ADMIN_ADD_POINTS_USER, ADMIN_ADD_POINTS_AMT,
+    ADMIN_BROADCAST_MSG,
+    ADMIN_TASK_NAME, ADMIN_TASK_LINK, ADMIN_TASK_POINTS, ADMIN_TASK_TYPE
+) = range(11)
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_conn():
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        points INTEGER DEFAULT 0,
+        join_date TEXT DEFAULT (datetime('now')),
+        referrer_id INTEGER DEFAULT NULL,
+        channel_joined INTEGER DEFAULT 0,
+        twitter_followed INTEGER DEFAULT 0,
+        twitter_liked INTEGER DEFAULT 0,
+        twitter_retweeted INTEGER DEFAULT 0
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS withdrawals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        network TEXT,
+        phone TEXT,
+        amount TEXT,
+        status TEXT,
+        time TEXT DEFAULT (datetime('now'))
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS referrals (
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        UNIQUE(referred_id)
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS custom_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        link TEXT,
+        points INTEGER,
+        task_type TEXT,
+        active INTEGER DEFAULT 1
+    )
+    """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS completed_tasks (
+        user_id INTEGER,
+        task_id INTEGER,
+        UNIQUE(user_id, task_id)
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_user(uid):
+    conn = get_conn()
+    u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    return u
+
+def get_user_by_username(username):
+    username = username.lstrip("@").lower()
+    conn = get_conn()
+    u = conn.execute("SELECT * FROM users WHERE LOWER(username)=?", (username,)).fetchone()
+    conn.close()
+    return u
+
+def create_user(uid, username, referrer_id=None):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?,?,?)",
+        (uid, username, referrer_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_points(uid, amt):
+    conn = get_conn()
+    conn.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amt, uid))
+    conn.commit()
+    conn.close()
+
+def get_points(uid):
+    conn = get_conn()
+    r = conn.execute("SELECT points FROM users WHERE user_id=?", (uid,)).fetchone()
+    conn.close()
+    return r["points"] if r else 0
+
+def get_all_users():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM users ORDER BY points DESC").fetchall()
+    conn.close()
+    return rows
+
+def get_withdrawals():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM withdrawals ORDER BY time DESC LIMIT 50").fetchall()
+    conn.close()
+    return rows
+
+def set_flag(uid, field):
+    conn = get_conn()
+    conn.execute(f"UPDATE users SET {field}=1 WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+def get_referral_count(uid):
+    conn = get_conn()
+    r = conn.execute("SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=?", (uid,)).fetchone()
+    conn.close()
+    return r["cnt"] if r else 0
+
+def get_active_tasks():
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM custom_tasks WHERE active=1").fetchall()
+    conn.close()
+    return rows
+
+def get_task(task_id):
+    conn = get_conn()
+    t = conn.execute("SELECT * FROM custom_tasks WHERE id=?", (task_id,)).fetchone()
+    conn.close()
+    return t
+
+def has_completed_task(uid, task_id):
+    conn = get_conn()
+    r = conn.execute("SELECT 1 FROM completed_tasks WHERE user_id=? AND task_id=?", (uid, task_id)).fetchone()
+    conn.close()
+    return r is not None
+
+def mark_task_complete(uid, task_id):
+    conn = get_conn()
+    try:
+        conn.execute("INSERT OR IGNORE INTO completed_tasks (user_id, task_id) VALUES (?,?)", (uid, task_id))
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+
+def add_custom_task(name, link, points, task_type):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO custom_tasks (name, link, points, task_type) VALUES (?,?,?,?)",
+        (name, link, points, task_type)
+    )
+    conn.commit()
+    conn.close()
+
+def delete_custom_task(task_id):
+    conn = get_conn()
+    conn.execute("UPDATE custom_tasks SET active=0 WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+async def is_member(bot, uid):
+    try:
+        member = await bot.get_chat_member(TELEGRAM_CHANNEL_ID, uid)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception:
+        return False
+
+def send_airtime_via_vtu(network, phone, amount):
+    try:
+        payload = {
+            "api_key": VTU_API_KEY,
+            "network": network.lower(),
+            "phone": phone,
+            "amount": amount,
+            "type": "airtime",
+        }
+        response = requests.post(VTU_API_URL, json=payload, timeout=30)
+        data = response.json()
+        return data.get("status") == "success", data.get("message", "Unknown error")
+    except Exception as e:
+        return False, str(e)
+
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 My Balance", callback_data="balance"),
+         InlineKeyboardButton("🎁 Earn Points", callback_data="earn")],
+        [InlineKeyboardButton("📤 Withdraw Airtime", callback_data="withdraw_start"),
+         InlineKeyboardButton("👥 Referral", callback_data="referral")],
+        [InlineKeyboardButton("📊 Leaderboard", callback_data="leaderboard")],
+    ])
+
+async def safe_edit(q, text, **kwargs):
+    try:
+        await q.edit_message_text(text, **kwargs)
+    except Exception:
+        await q.message.reply_text(text, **kwargs)
+
+def task_type_emoji(t):
+    return {"follow": "🐦", "like": "❤️", "retweet": "🔁", "join": "📢"}.get(t, "✅")
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+    referrer_id = None
+
+    if args and args[0].startswith("ref_"):
+        try:
+            referrer_id = int(args[0].replace("ref_", ""))
+            if referrer_id == user.id:
+                referrer_id = None
+        except ValueError:
+            pass
+
+    existing = get_user(user.id)
+    create_user(user.id, user.username, referrer_id)
+
+    if not existing and referrer_id:
+        ref_user = get_user(referrer_id)
+        if ref_user:
+            conn = get_conn()
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?,?)",
+                    (referrer_id, user.id)
+                )
+                conn.commit()
+            except Exception:
+                pass
+            conn.close()
+            update_points(referrer_id, POINTS_REFERRAL)
+            try:
+                await context.bot.send_message(
+                    referrer_id,
+                    f"🎉 You earned *+{POINTS_REFERRAL} points!* Someone joined via your referral link.",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+    await update.message.reply_text(
+        f"👋 Welcome to *Nexarion Bot*, {user.first_name}!\n\n"
+        f"Earn points by completing tasks and redeem them for FREE airtime! 📱\n\n"
+        f"📌 *1000 points = ₦300 airtime*\n"
+        f"📌 *1667 points = ₦500 airtime*\n"
+        f"📌 *3334 points = ₦1000 airtime*\n\n"
+        f"Use the menu below to get started:",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await safe_edit(q,
+        "🏠 *Main Menu*\n\nChoose an option below:",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+
+# ============================================================
+# BALANCE
+# ============================================================
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    pts = get_points(uid)
+    refs = get_referral_count(uid)
+    await safe_edit(q,
+        f"💰 *Your Balance*\n\n"
+        f"Points: *{pts}*\n"
+        f"Referrals: *{refs}*\n\n"
+        f"🏆 Redemption rates:\n"
+        f"1000 pts = ₦300 airtime\n"
+        f"1667 pts = ₦500 airtime\n"
+        f"3334 pts = ₦1000 airtime",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]])
+    )
+
+# ============================================================
+# EARN POINTS
+# ============================================================
+
+async def earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+    kb = []
+
+    if not user["channel_joined"]:
+        kb.append([InlineKeyboardButton("📢 Join Telegram Channel (+20)", callback_data="task_channel")])
+    if not user["twitter_followed"]:
+        kb.append([InlineKeyboardButton("🐦 Follow on Twitter (+10)", callback_data="task_follow")])
+    if not user["twitter_liked"]:
+        kb.append([InlineKeyboardButton("❤️ Like Tweet (+10)", callback_data="task_like")])
+    if not user["twitter_retweeted"]:
+        kb.append([InlineKeyboardButton("🔁 Retweet (+15)", callback_data="task_retweet")])
+
+    custom_tasks = get_active_tasks()
+    for task in custom_tasks:
+        if not has_completed_task(uid, task["id"]):
+            emoji = task_type_emoji(task["task_type"])
+            kb.append([InlineKeyboardButton(
+                f"{emoji} {task['name']} (+{task['points']})",
+                callback_data=f"custom_task_{task['id']}"
+            )])
+
+    if not kb:
+        kb.append([InlineKeyboardButton("✅ All tasks completed!", callback_data="earn")])
+
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    await safe_edit(q,
+        "🎁 *Earn Points*\n\nComplete tasks below to earn points:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+# ============================================================
+# FIXED TASKS
+# ============================================================
+
+async def task_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["channel_joined"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    joined = await is_member(context.bot, uid)
+    if joined:
+        set_flag(uid, "channel_joined")
+        update_points(uid, POINTS_JOIN_CHANNEL)
+        await safe_edit(q,
+            f"✅ Verified! You earned *+{POINTS_JOIN_CHANNEL} points*.\n\nNew balance: *{get_points(uid)} points*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Tasks", callback_data="earn")]])
+        )
+    else:
+        kb = [
+            [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{TELEGRAM_CHANNEL_USERNAME.lstrip('@')}")],
+            [InlineKeyboardButton("✅ I've Joined — Verify", callback_data="task_channel_verify")],
+            [InlineKeyboardButton("🔙 Back", callback_data="earn")],
+        ]
+        await safe_edit(q,
+            "📢 Join our Telegram channel to earn points!\n\nAfter joining tap *I've Joined — Verify*.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+
+async def task_channel_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["channel_joined"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    joined = await is_member(context.bot, uid)
+    if joined:
+        set_flag(uid, "channel_joined")
+        update_points(uid, POINTS_JOIN_CHANNEL)
+        await safe_edit(q,
+            f"✅ Verified! You earned *+{POINTS_JOIN_CHANNEL} points*.\n\nNew balance: *{get_points(uid)} points*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Tasks", callback_data="earn")]])
+        )
+    else:
+        await q.answer("❌ You haven't joined yet!", show_alert=True)
+
+async def task_twitter_follow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["twitter_followed"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    kb = [
+        [InlineKeyboardButton("🐦 Follow on Twitter", url=f"https://twitter.com/{TWITTER_ACCOUNT.lstrip('@')}")],
+        [InlineKeyboardButton("✅ Done — Claim Points", callback_data="claim_follow")],
+        [InlineKeyboardButton("🔙 Back", callback_data="earn")],
+    ]
+    await safe_edit(q,
+        f"🐦 Follow *{TWITTER_ACCOUNT}* on Twitter to earn *+{POINTS_TWITTER_FOLLOW} points*.\n\nTap *Done* after following.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def claim_follow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["twitter_followed"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    set_flag(uid, "twitter_followed")
+    update_points(uid, POINTS_TWITTER_FOLLOW)
+    await safe_edit(q,
+        f"✅ You earned *+{POINTS_TWITTER_FOLLOW} points* for following!\n\nBalance: *{get_points(uid)} points*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Tasks", callback_data="earn")]])
+    )
+
+async def task_twitter_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["twitter_liked"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    kb = [
+        [InlineKeyboardButton("❤️ Like Tweet", url="https://twitter.com")],
+        [InlineKeyboardButton("✅ Done — Claim Points", callback_data="claim_like")],
+        [InlineKeyboardButton("🔙 Back", callback_data="earn")],
+    ]
+    await safe_edit(q,
+        f"❤️ Like our pinned tweet to earn *+{POINTS_TWITTER_LIKE} points*.\n\nTap *Done* after liking.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def claim_like(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["twitter_liked"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    set_flag(uid, "twitter_liked")
+    update_points(uid, POINTS_TWITTER_LIKE)
+    await safe_edit(q,
+        f"✅ You earned *+{POINTS_TWITTER_LIKE} points* for liking!\n\nBalance: *{get_points(uid)} points*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Tasks", callback_data="earn")]])
+    )
+
+async def task_twitter_retweet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["twitter_retweeted"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    kb = [
+        [InlineKeyboardButton("🔁 Retweet", url="https://twitter.com")],
+        [InlineKeyboardButton("✅ Done — Claim Points", callback_data="claim_retweet")],
+        [InlineKeyboardButton("🔙 Back", callback_data="earn")],
+    ]
+    await safe_edit(q,
+        f"🔁 Retweet our pinned tweet to earn *+{POINTS_TWITTER_RT} points*.\n\nTap *Done* after retweeting.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def claim_retweet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    user = get_user(uid)
+
+    if user and user["twitter_retweeted"]:
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    set_flag(uid, "twitter_retweeted")
+    update_points(uid, POINTS_TWITTER_RT)
+    await safe_edit(q,
+        f"✅ You earned *+{POINTS_TWITTER_RT} points* for retweeting!\n\nBalance: *{get_points(uid)} points*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Tasks", callback_data="earn")]])
+    )
+
+# ============================================================
+# CUSTOM TASKS
+# ============================================================
+
+async def custom_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    task_id = int(q.data.replace("custom_task_", ""))
+    task = get_task(task_id)
+
+    if not task:
+        await q.answer("Task not found!", show_alert=True)
+        return
+
+    if has_completed_task(uid, task_id):
+        await q.answer("✅ Already claimed!", show_alert=True)
+        return
+
+    emoji = task_type_emoji(task["task_type"])
+    kb = [
+        [InlineKeyboardButton(f"{emoji} Go to Task", url=task["link"])],
+        [InlineKeyboardButton("✅ Done — Claim Points", callback_data=f"claim_custom_{task_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="earn")],
+    ]
+    await safe_edit(q,
+        f"{emoji} *{task['name']}*\n\nComplete this task to earn *+{task['points']} points*.\n\nTap *Done* after completing.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def claim_custom_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    task_id = int(q.data.rep
