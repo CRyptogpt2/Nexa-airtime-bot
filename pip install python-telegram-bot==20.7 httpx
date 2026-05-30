@@ -1,12 +1,11 @@
 # ============================================================
-# NEXARION REWARDS BOT - COMPLETE SINGLE FILE
+# NEXARION REWARDS BOT - COMPLETE SINGLE FILE (FIXED)
 # ============================================================
 
 import logging
 import sqlite3
 import httpx
 import uuid
-import asyncio
 from datetime import datetime, date
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -157,7 +156,6 @@ def init_db():
         )
     """)
 
-    # Default settings
     defaults = {
         "points_per_conversion": "1000",
         "naira_per_conversion": "300",
@@ -166,12 +164,15 @@ def init_db():
         "referral_reward": "70",
         "channel_reward": "50",
         "x_reward": "50",
-        "welcome_message": "Welcome to Nexarion Rewards Bot.\n\nComplete tasks, invite friends, earn points, and redeem airtime.\n\nTo continue, join our Telegram channel."
+        "welcome_message": (
+            "Welcome to Nexarion Rewards Bot.\n\n"
+            "Complete tasks, invite friends, earn points, and redeem airtime.\n\n"
+            "To continue, join our Telegram channel."
+        )
     }
     for key, value in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-    # Seed admins
     for admin_id in ADMIN_IDS:
         c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (admin_id,))
 
@@ -212,8 +213,16 @@ def get_user(user_id):
 
 def update_user_points(user_id, points, description, txn_type="earn"):
     conn = get_db()
-    conn.execute("UPDATE users SET points = points + ?, total_earned = total_earned + ? WHERE user_id=?",
-                 (points, points if points > 0 else 0, user_id))
+    if points > 0:
+        conn.execute(
+            "UPDATE users SET points=points+?, total_earned=total_earned+? WHERE user_id=?",
+            (points, points, user_id)
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET points=points+? WHERE user_id=?",
+            (points, user_id)
+        )
     conn.execute("""
         INSERT INTO transactions (user_id, type, points, description, created_at)
         VALUES (?, ?, ?, ?, ?)
@@ -291,15 +300,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_user = get_or_create_user(user.id, user.username or "", user.first_name or "")
 
-    # Handle referral code
     if args and not db_user["referred_by"]:
         ref_code = args[0]
         conn = get_db()
-        referrer = conn.execute("SELECT * FROM users WHERE referral_code=?", (ref_code,)).fetchone()
+        referrer = conn.execute(
+            "SELECT * FROM users WHERE referral_code=?", (ref_code,)
+        ).fetchone()
         conn.close()
         if referrer and referrer["user_id"] != user.id:
             conn = get_db()
-            conn.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer["user_id"], user.id))
+            conn.execute(
+                "UPDATE users SET referred_by=? WHERE user_id=?",
+                (referrer["user_id"], user.id)
+            )
             conn.execute("""
                 INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at)
                 VALUES (?, ?, ?)
@@ -327,6 +340,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(welcome_msg, reply_markup=keyboard)
 
+
 async def verify_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -350,15 +364,15 @@ async def verify_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Channel verified! You earned *{reward} points*.\n\nNext: Follow us on X.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🐦 Follow on X", url=X_LINK,")],
+                    [InlineKeyboardButton("🐦 Follow on X", url=X_LINK)],
                     [InlineKeyboardButton("✅ Done", callback_data="x_follow_done")]
                 ])
             )
-            context.user_data["x_link_opened"] = False
         else:
             await query.answer("❌ You haven't joined the channel yet!", show_alert=True)
-    except Exception as e:
+    except Exception:
         await query.answer("❌ Verification failed. Please join and try again.", show_alert=True)
+
 
 async def show_x_follow(query):
     await query.edit_message_text(
@@ -369,22 +383,15 @@ async def show_x_follow(query):
         ])
     )
 
-async def x_follow_opened(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Opening X... Come back and click Done.")
-    context.user_data["x_link_opened"] = True
 
 async def x_follow_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
     user = update.effective_user
     db_user = get_user(user.id)
 
     if db_user["x_followed"]:
-        await complete_onboarding(query, user.id)
-        return
-
-    if not context.user_data.get("x_link_opened"):
-        await query.answer("⚠️ Please click 'Follow on X' first before clicking Done.", show_alert=True)
+        await complete_onboarding(query, context, user.id)
         return
 
     reward = int(get_setting("x_reward"))
@@ -393,32 +400,42 @@ async def x_follow_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     update_user_points(user.id, reward, "Followed on X")
-    await complete_onboarding(query, user.id)
+    await complete_onboarding(query, context, user.id)
 
-async def complete_onboarding(query, user_id):
+
+async def complete_onboarding(query, context, user_id):
     conn = get_db()
     conn.execute("UPDATE users SET onboarding_complete=1 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
-
-    # Reward referrer
-    referral = conn = get_db()
     ref_row = conn.execute("""
         SELECT * FROM referrals WHERE referred_id=? AND rewarded=0
     """, (user_id,)).fetchone()
+    conn.commit()
     conn.close()
 
     if ref_row:
         ref_reward = int(get_setting("referral_reward"))
-        update_user_points(ref_row["referrer_id"], ref_reward, f"Referral bonus for user {user_id}")
+        update_user_points(
+            ref_row["referrer_id"], ref_reward,
+            f"Referral bonus for user {user_id}"
+        )
         conn = get_db()
         conn.execute("UPDATE referrals SET rewarded=1 WHERE id=?", (ref_row["id"],))
         conn.commit()
         conn.close()
+        try:
+            await context.bot.send_message(
+                ref_row["referrer_id"],
+                f"🎉 Your referral just completed onboarding! You earned *{ref_reward} points*.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
 
     x_reward = int(get_setting("x_reward"))
     await query.edit_message_text(
-        f"🎉 *Onboarding Complete!*\n\nYou've earned *{x_reward} points* for following on X.\n\nYou now have full access to Nexarion Rewards Bot!",
+        f"🎉 *Onboarding Complete!*\n\n"
+        f"You earned *{x_reward} points* for following on X.\n\n"
+        f"You now have full access to Nexarion Rewards Bot!",
         parse_mode="Markdown",
         reply_markup=home_keyboard()
     )
@@ -447,10 +464,10 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❓ *Help*\n\n"
         "• Complete tasks to earn points\n"
         "• Invite friends using your referral link\n"
-        "• Redeem 1000 points for ₦300 airtime\n"
+        "• 1000 points = ₦300 airtime\n"
         "• Minimum withdrawal: 1000 points\n"
         "• Daily limit: ₦3000\n\n"
-        "For support contact the admin."
+        "Contact admin for support."
     )
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_home())
 
@@ -466,10 +483,12 @@ async def profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     ref_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=? AND rewarded=1", (user_id,)
+        "SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=? AND rewarded=1",
+        (user_id,)
     ).fetchone()["cnt"]
-    ref_earnings = ref_count * int(get_setting("referral_reward"))
     conn.close()
+
+    ref_earnings = ref_count * int(get_setting("referral_reward"))
 
     text = (
         f"👤 *Profile*\n\n"
@@ -496,7 +515,8 @@ async def referral_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     ref_count = conn.execute(
-        "SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=? AND rewarded=1", (user_id,)
+        "SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id=? AND rewarded=1",
+        (user_id,)
     ).fetchone()["cnt"]
     conn.close()
 
@@ -508,7 +528,8 @@ async def referral_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Your referral link:\n`{ref_link}`\n\n"
         f"👥 Successful Referrals: *{ref_count}*\n"
         f"💰 Reward per referral: *{ref_reward} points*\n\n"
-        f"Share your link and earn {ref_reward} points for every friend who completes onboarding!"
+        f"Share your link and earn *{ref_reward} points* for every friend "
+        f"who completes onboarding!"
     )
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_home())
 
@@ -549,36 +570,28 @@ async def tasks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+
 async def task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-
     data = query.data
-    if data.startswith("task_open_"):
-        task_id = int(data.split("_")[2])
-        context.user_data[f"opened_task_{task_id}"] = True
-        await query.answer("Link opened! Come back and click Done.", show_alert=True)
-        return
 
     if data.startswith("task_done_"):
         task_id = int(data.split("_")[2])
         conn = get_db()
         already = conn.execute(
-            "SELECT 1 FROM completed_tasks WHERE user_id=? AND task_id=?", (user_id, task_id)
+            "SELECT 1 FROM completed_tasks WHERE user_id=? AND task_id=?",
+            (user_id, task_id)
         ).fetchone()
+        task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         conn.close()
 
         if already:
             await query.answer("✅ You already completed this task.", show_alert=True)
             return
 
-        if not context.user_data.get(f"opened_task_{task_id}"):
-            await query.answer("⚠️ Please open the task link first.", show_alert=True)
-            return
-
         conn = get_db()
-        task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         conn.execute("""
             INSERT INTO completed_tasks (user_id, task_id, completed_at)
             VALUES (?, ?, ?)
@@ -599,7 +612,8 @@ async def task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     already = conn.execute(
-        "SELECT 1 FROM completed_tasks WHERE user_id=? AND task_id=?", (user_id, task_id)
+        "SELECT 1 FROM completed_tasks WHERE user_id=? AND task_id=?",
+        (user_id, task_id)
     ).fetchone()
     conn.close()
 
@@ -626,7 +640,6 @@ async def task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Done", callback_data=f"task_done_{task_id}")],
         [InlineKeyboardButton("◀️ Back", callback_data="tasks")]
     ])
-    context.user_data[f"opened_task_{task_id}"] = False
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 # ============================================================
@@ -647,7 +660,7 @@ async def leaderboard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = "🏆 *Top 10 Leaderboard*\n\n"
     medals = ["🥇", "🥈", "🥉"]
     for i, u in enumerate(top):
-        medal = medals[i] if i < 3 else f"{i+1}."
+        medal = medals[i] if i < 3 else f"{i + 1}."
         name = u["first_name"] or u["username"] or "Anonymous"
         text += f"{medal} {name} — *{u['points']} pts*\n"
 
@@ -666,7 +679,9 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     min_pts = int(get_setting("min_withdrawal"))
     if user["points"] < min_pts:
         await query.edit_message_text(
-            f"❌ Insufficient points.\n\nYou need at least *{min_pts} points* to withdraw.\nYour balance: *{user['points']} points*",
+            f"❌ Insufficient points.\n\n"
+            f"You need at least *{min_pts} points* to withdraw.\n"
+            f"Your balance: *{user['points']} points*",
             parse_mode="Markdown",
             reply_markup=back_home()
         )
@@ -676,7 +691,7 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     daily_used = get_daily_withdrawn(user_id)
     if daily_used >= daily_limit:
         await query.edit_message_text(
-            f"❌ Daily withdrawal limit of ₦{daily_limit} reached. Try again tomorrow.",
+            f"❌ Daily withdrawal limit of ₦{daily_limit:.0f} reached. Try again tomorrow.",
             reply_markup=back_home()
         )
         return ConversationHandler.END
@@ -686,6 +701,7 @@ async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
     return WITHDRAW_PHONE
+
 
 async def withdraw_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
@@ -702,6 +718,7 @@ async def withdraw_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text("Select your network:", reply_markup=keyboard)
     return WITHDRAW_NETWORK
+
 
 async def withdraw_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -734,13 +751,14 @@ async def withdraw_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💸 *Withdrawal Summary*\n\n"
         f"📱 Phone: `{context.user_data['withdraw_phone']}`\n"
         f"📡 Network: *{network}*\n"
-        f"💰 Points: *{max_pts}*\n"
-        f"💵 Airtime: *₦{naira:.0f}*\n\n"
+        f"💰 Points to deduct: *{max_pts}*\n"
+        f"💵 Airtime value: *₦{naira:.0f}*\n\n"
         f"Confirm?",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
     return WITHDRAW_CONFIRM
+
 
 async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -763,41 +781,51 @@ async def withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         conn = get_db()
         conn.execute("""
-            INSERT INTO withdrawals (user_id, phone, network, points, naira_amount, status, created_at, processed_at)
+            INSERT INTO withdrawals
+            (user_id, phone, network, points, naira_amount, status, created_at, processed_at)
             VALUES (?, ?, ?, ?, ?, 'completed', ?, ?)
-        """, (user_id, phone, network, points, naira, datetime.now().isoformat(), datetime.now().isoformat()))
-        conn.execute("UPDATE users SET points = points - ?, total_withdrawn = total_withdrawn + ? WHERE user_id=?",
-                     (points, points, user_id))
+        """, (user_id, phone, network, points, naira,
+              datetime.now().isoformat(), datetime.now().isoformat()))
+        conn.execute(
+            "UPDATE users SET total_withdrawn=total_withdrawn+? WHERE user_id=?",
+            (points, user_id)
+        )
         conn.commit()
         conn.close()
         update_user_points(user_id, -points, f"Airtime withdrawal ₦{naira:.0f}", txn_type="withdraw")
 
         await query.edit_message_text(
-            f"✅ *Success!*\n\n₦{naira:.0f} airtime sent to *{phone}* ({network}).\n\n*{points} points* deducted.",
+            f"✅ *Success!*\n\n"
+            f"₦{naira:.0f} airtime sent to *{phone}* ({network}).\n"
+            f"*{points} points* deducted from your balance.",
             parse_mode="Markdown",
             reply_markup=back_home()
         )
-
-        # Notify admin
         for admin_id in ADMIN_IDS:
             try:
                 await context.bot.send_message(
                     admin_id,
-                    f"💸 Airtime Sent\nUser: {user_id}\nPhone: {phone}\nNetwork: {network}\nAmount: ₦{naira:.0f}\nStatus: ✅ Success"
+                    f"💸 *Airtime Sent*\n"
+                    f"User: {user_id}\nPhone: {phone}\n"
+                    f"Network: {network}\nAmount: ₦{naira:.0f}\nStatus: ✅ Success",
+                    parse_mode="Markdown"
                 )
-            except:
+            except Exception:
                 pass
     else:
         conn = get_db()
         conn.execute("""
-            INSERT INTO withdrawals (user_id, phone, network, points, naira_amount, status, created_at)
+            INSERT INTO withdrawals
+            (user_id, phone, network, points, naira_amount, status, created_at)
             VALUES (?, ?, ?, ?, ?, 'failed', ?)
         """, (user_id, phone, network, points, naira, datetime.now().isoformat()))
         conn.commit()
         conn.close()
 
         await query.edit_message_text(
-            f"❌ Airtime delivery failed.\n\nError: {response.get('message', 'Unknown error')}\n\nYour points were NOT deducted. Please try again.",
+            f"❌ Airtime delivery failed.\n\n"
+            f"Error: {response.get('message', response.get('error', 'Unknown error'))}\n\n"
+            f"Your points were NOT deducted. Please try again.",
             reply_markup=back_home()
         )
 
@@ -815,9 +843,13 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     total_users = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
-    total_pts = conn.execute("SELECT COALESCE(SUM(points),0) as s FROM transactions WHERE type='earn'").fetchone()["s"]
+    total_pts = conn.execute(
+        "SELECT COALESCE(SUM(points),0) as s FROM transactions WHERE type='earn'"
+    ).fetchone()["s"]
     total_w = conn.execute("SELECT COUNT(*) as c FROM withdrawals").fetchone()["c"]
-    pending_w = conn.execute("SELECT COUNT(*) as c FROM withdrawals WHERE status='pending'").fetchone()["c"]
+    pending_w = conn.execute(
+        "SELECT COUNT(*) as c FROM withdrawals WHERE status='pending'"
+    ).fetchone()["c"]
     conn.close()
 
     text = (
@@ -835,6 +867,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")]
     ])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -856,6 +889,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for t in tasks:
             status = "🟢" if t["is_active"] else "🔴"
             text += f"{status} [{t['task_id']}] {t['title']} (+{t['reward']} pts)\n"
+        if not tasks:
+            text += "No tasks yet."
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add Task", callback_data="admin_add_task")],
             [InlineKeyboardButton("✏️ Edit Task", callback_data="admin_edit_task"),
@@ -863,8 +898,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Activate", callback_data="admin_activate_task"),
              InlineKeyboardButton("⛔ Deactivate", callback_data="admin_deactivate_task")],
         ])
-        await query.edit_message_text(text or "No tasks.", parse_mode="Markdown", reply_markup=keyboard)
-        return
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return ConversationHandler.END
 
     if data == "admin_add_task":
         context.user_data["add_task"] = {}
@@ -880,22 +915,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_TASK_TYPE
 
     if data == "admin_edit_task":
+        context.user_data["admin_action"] = "edit_task"
+        context.user_data.pop("edit_task_id", None)
         await query.edit_message_text("Enter Task ID to edit:")
         return EDIT_TASK_ID
 
     if data == "admin_remove_task":
-        await query.edit_message_text("Enter Task ID to remove:")
         context.user_data["admin_action"] = "remove_task"
+        await query.edit_message_text("Enter Task ID to remove:")
         return EDIT_TASK_ID
 
     if data == "admin_activate_task":
-        await query.edit_message_text("Enter Task ID to activate:")
         context.user_data["admin_action"] = "activate_task"
+        await query.edit_message_text("Enter Task ID to activate:")
         return EDIT_TASK_ID
 
     if data == "admin_deactivate_task":
-        await query.edit_message_text("Enter Task ID to deactivate:")
         context.user_data["admin_action"] = "deactivate_task"
+        await query.edit_message_text("Enter Task ID to deactivate:")
         return EDIT_TASK_ID
 
     # ---- USERS ----
@@ -907,21 +944,25 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban_user"),
              InlineKeyboardButton("✅ Unban User", callback_data="admin_unban_user")],
         ])
-        await query.edit_message_text("👥 *User Management*", parse_mode="Markdown", reply_markup=keyboard)
-        return
+        await query.edit_message_text(
+            "👥 *User Management*", parse_mode="Markdown", reply_markup=keyboard
+        )
+        return ConversationHandler.END
 
     if data == "admin_search_user":
         context.user_data["admin_action"] = "search_user"
-        await query.edit_message_text("Enter user ID or username:")
+        await query.edit_message_text("Enter user ID or @username:")
         return SEARCH_USER
 
     if data == "admin_add_points":
         context.user_data["admin_action"] = "add_points"
+        context.user_data.pop("target_user_id", None)
         await query.edit_message_text("Enter user ID:")
         return ADD_POINTS_ID
 
     if data == "admin_remove_points":
         context.user_data["admin_action"] = "remove_points"
+        context.user_data.pop("target_user_id", None)
         await query.edit_message_text("Enter user ID:")
         return REMOVE_POINTS_ID
 
@@ -945,19 +986,30 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """).fetchall()
         conn.close()
         if not pending:
-            await query.edit_message_text("No pending withdrawals.", reply_markup=back_home())
-            return
+            await query.edit_message_text(
+                "No pending withdrawals.", reply_markup=back_home()
+            )
+            return ConversationHandler.END
 
         text = "💸 *Pending Withdrawals*\n\n"
         buttons = []
         for w in pending:
-            text += f"ID:{w['id']} | @{w['username']} | {w['network']} | {w['phone']} | ₦{w['naira_amount']:.0f}\n"
+            text += (
+                f"ID:{w['id']} | @{w['username']} | "
+                f"{w['network']} | {w['phone']} | ₦{w['naira_amount']:.0f}\n"
+            )
             buttons.append([
-                InlineKeyboardButton(f"✅ Approve #{w['id']}", callback_data=f"admin_approve_{w['id']}"),
-                InlineKeyboardButton(f"❌ Reject #{w['id']}", callback_data=f"admin_reject_{w['id']}")
+                InlineKeyboardButton(
+                    f"✅ Approve #{w['id']}", callback_data=f"admin_approve_{w['id']}"
+                ),
+                InlineKeyboardButton(
+                    f"❌ Reject #{w['id']}", callback_data=f"admin_reject_{w['id']}"
+                )
             ])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-        return
+        await query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return ConversationHandler.END
 
     if data.startswith("admin_approve_"):
         w_id = int(data.split("_")[2])
@@ -968,36 +1020,50 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success, resp = await send_airtime(w["phone"], w["network"], w["naira_amount"])
             if success:
                 conn = get_db()
-                conn.execute("UPDATE withdrawals SET status='completed', processed_at=? WHERE id=?",
-                             (datetime.now().isoformat(), w_id))
-                conn.execute("UPDATE users SET points=points-?, total_withdrawn=total_withdrawn+? WHERE user_id=?",
-                             (w["points"], w["points"], w["user_id"]))
+                conn.execute(
+                    "UPDATE withdrawals SET status='completed', processed_at=? WHERE id=?",
+                    (datetime.now().isoformat(), w_id)
+                )
+                conn.execute(
+                    "UPDATE users SET points=points-?, total_withdrawn=total_withdrawn+? WHERE user_id=?",
+                    (w["points"], w["points"], w["user_id"])
+                )
                 conn.commit()
                 conn.close()
                 await query.edit_message_text(f"✅ Airtime sent for withdrawal #{w_id}")
                 try:
-                    await context.bot.send_message(w["user_id"], f"✅ Your airtime withdrawal of ₦{w['naira_amount']:.0f} has been processed!")
-                except:
+                    await context.bot.send_message(
+                        w["user_id"],
+                        f"✅ Your airtime withdrawal of ₦{w['naira_amount']:.0f} has been processed!"
+                    )
+                except Exception:
                     pass
             else:
-                await query.edit_message_text(f"❌ Airtime failed: {resp.get('message', 'Unknown')}")
-        return
+                await query.edit_message_text(
+                    f"❌ Airtime failed: {resp.get('message', resp.get('error', 'Unknown'))}"
+                )
+        return ConversationHandler.END
 
     if data.startswith("admin_reject_"):
         w_id = int(data.split("_")[2])
         conn = get_db()
         w = conn.execute("SELECT * FROM withdrawals WHERE id=?", (w_id,)).fetchone()
-        conn.execute("UPDATE withdrawals SET status='rejected', processed_at=? WHERE id=?",
-                     (datetime.now().isoformat(), w_id))
+        conn.execute(
+            "UPDATE withdrawals SET status='rejected', processed_at=? WHERE id=?",
+            (datetime.now().isoformat(), w_id)
+        )
         conn.commit()
         conn.close()
         await query.edit_message_text(f"❌ Withdrawal #{w_id} rejected.")
         if w:
             try:
-                await context.bot.send_message(w["user_id"], "❌ Your withdrawal request was rejected. Your points were not deducted.")
-            except:
+                await context.bot.send_message(
+                    w["user_id"],
+                    "❌ Your withdrawal request was rejected. Your points were not deducted."
+                )
+            except Exception:
                 pass
-        return
+        return ConversationHandler.END
 
     # ---- BROADCAST ----
     if data == "admin_broadcast":
@@ -1008,7 +1074,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📄 Document", callback_data="admin_broadcast_doc")],
         ])
         await query.edit_message_text("📣 Select broadcast type:", reply_markup=keyboard)
-        return
+        return ConversationHandler.END
 
     if data == "admin_broadcast_text":
         context.user_data["broadcast_type"] = "text"
@@ -1032,16 +1098,16 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- SETTINGS ----
     if data == "admin_settings":
+        pts = get_setting("points_per_conversion")
+        naira = get_setting("naira_per_conversion")
+        limit = get_setting("daily_limit_naira")
+        ref = get_setting("referral_reward")
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("💱 Point Conversion", callback_data="admin_set_conversion")],
             [InlineKeyboardButton("📉 Withdrawal Limit", callback_data="admin_set_limit")],
             [InlineKeyboardButton("👋 Welcome Message", callback_data="admin_set_welcome")],
             [InlineKeyboardButton("🎁 Referral Reward", callback_data="admin_set_referral_reward")],
         ])
-        pts = get_setting("points_per_conversion")
-        naira = get_setting("naira_per_conversion")
-        limit = get_setting("daily_limit_naira")
-        ref = get_setting("referral_reward")
         await query.edit_message_text(
             f"⚙️ *Settings*\n\n"
             f"💱 {pts} pts = ₦{naira}\n"
@@ -1050,7 +1116,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=keyboard
         )
-        return
+        return ConversationHandler.END
 
     if data == "admin_set_conversion":
         await query.edit_message_text("Enter new conversion (format: points:naira e.g. 1000:300):")
@@ -1070,11 +1136,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+
 # ---- BROADCAST INPUT ----
 async def broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btype = context.user_data.get("broadcast_type")
     conn = get_db()
-    users = conn.execute("SELECT user_id FROM users WHERE onboarding_complete=1 AND is_banned=0").fetchall()
+    users = conn.execute(
+        "SELECT user_id FROM users WHERE onboarding_complete=1 AND is_banned=0"
+    ).fetchall()
     conn.close()
 
     sent = 0
@@ -1084,17 +1153,29 @@ async def broadcast_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if btype == "text":
                 await context.bot.send_message(u["user_id"], update.message.text)
             elif btype == "photo" and update.message.photo:
-                await context.bot.send_photo(u["user_id"], update.message.photo[-1].file_id, caption=update.message.caption or "")
+                await context.bot.send_photo(
+                    u["user_id"], update.message.photo[-1].file_id,
+                    caption=update.message.caption or ""
+                )
             elif btype == "video" and update.message.video:
-                await context.bot.send_video(u["user_id"], update.message.video.file_id, caption=update.message.caption or "")
+                await context.bot.send_video(
+                    u["user_id"], update.message.video.file_id,
+                    caption=update.message.caption or ""
+                )
             elif btype == "doc" and update.message.document:
-                await context.bot.send_document(u["user_id"], update.message.document.file_id, caption=update.message.caption or "")
+                await context.bot.send_document(
+                    u["user_id"], update.message.document.file_id,
+                    caption=update.message.caption or ""
+                )
             sent += 1
-        except:
+        except Exception:
             failed += 1
 
-    await update.message.reply_text(f"📣 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}")
+    await update.message.reply_text(
+        f"📣 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}"
+    )
     return ConversationHandler.END
+
 
 # ---- ADD TASK ----
 async def add_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1118,7 +1199,7 @@ async def add_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "description" not in task:
         task["description"] = text
         context.user_data["add_task"] = task
-        await update.message.reply_text("Enter task link:")
+        await update.message.reply_text("Enter task link (URL):")
         return ADD_TASK_LINK
 
     if "link" not in task:
@@ -1129,7 +1210,7 @@ async def add_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "reward" not in task:
         if not text.isdigit():
-            await update.message.reply_text("Enter a valid number:")
+            await update.message.reply_text("❌ Enter a valid number:")
             return ADD_TASK_REWARD
         task["reward"] = int(text)
         conn = get_db()
@@ -1139,9 +1220,10 @@ async def add_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (task["title"], task["description"], task["link"], task["reward"], task["type"]))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ Task '{task['title']}' added successfully!")
+        await update.message.reply_text(f"✅ Task *{task['title']}* added!", parse_mode="Markdown")
         context.user_data.pop("add_task", None)
         return ConversationHandler.END
+
 
 # ---- EDIT TASK ----
 async def edit_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1150,7 +1232,7 @@ async def edit_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         field = query.data.replace("editfield_", "")
         context.user_data["edit_field"] = field
-        await query.edit_message_text(f"Enter new value for {field}:")
+        await query.edit_message_text(f"Enter new value for *{field}*:", parse_mode="Markdown")
         return EDIT_TASK_VALUE
 
     text = update.message.text.strip()
@@ -1197,12 +1279,13 @@ async def edit_task_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.execute(f"UPDATE tasks SET {field}=? WHERE task_id=?", (text, task_id))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"✅ Task {task_id} {field} updated.")
+    await update.message.reply_text(f"✅ Task {task_id} *{field}* updated.", parse_mode="Markdown")
     context.user_data.pop("edit_task_id", None)
     context.user_data.pop("edit_field", None)
     return ConversationHandler.END
 
-# ---- SEARCH USER ----
+
+# ---- SEARCH / BAN / UNBAN USER ----
 async def search_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     action = context.user_data.get("admin_action", "search_user")
@@ -1221,9 +1304,9 @@ async def search_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (user["user_id"],))
             conn.commit()
             conn.close()
-            await update.message.reply_text(f"🚫 User {user['user_id']} banned.")
+            await update.message.reply_text(f"🚫 User {user['user_id']} has been banned.")
         else:
-            await update.message.reply_text("User not found.")
+            await update.message.reply_text("❌ User not found.")
         return ConversationHandler.END
 
     if action == "unban":
@@ -1232,22 +1315,22 @@ async def search_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (user["user_id"],))
             conn.commit()
             conn.close()
-            await update.message.reply_text(f"✅ User {user['user_id']} unbanned.")
+            await update.message.reply_text(f"✅ User {user['user_id']} has been unbanned.")
         else:
-            await update.message.reply_text("User not found.")
+            await update.message.reply_text("❌ User not found.")
         return ConversationHandler.END
 
     if not user:
-        await update.message.reply_text("User not found.")
+        await update.message.reply_text("❌ User not found.")
         return ConversationHandler.END
 
     text_out = (
         f"👤 *User Info*\n\n"
         f"🆔 ID: `{user['user_id']}`\n"
-        f"👤 Username: @{user['username']}\n"
-        f"💰 Points: {user['points']}\n"
-        f"📈 Total Earned: {user['total_earned']}\n"
-        f"💸 Total Withdrawn: {user['total_withdrawn']}\n"
+        f"👤 Username: @{user['username'] or 'N/A'}\n"
+        f"💰 Points: *{user['points']}*\n"
+        f"📈 Total Earned: *{user['total_earned']}*\n"
+        f"💸 Total Withdrawn: *{user['total_withdrawn']}*\n"
         f"✅ Onboarded: {'Yes' if user['onboarding_complete'] else 'No'}\n"
         f"🚫 Banned: {'Yes' if user['is_banned'] else 'No'}\n"
         f"📅 Joined: {user['join_date'][:10]}"
@@ -1255,30 +1338,47 @@ async def search_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text_out, parse_mode="Markdown")
     return ConversationHandler.END
 
+
 # ---- ADD / REMOVE POINTS ----
 async def add_points_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if "target_user_id" not in context.user_data:
+        if not text.isdigit():
+            await update.message.reply_text("❌ Enter a valid user ID:")
+            return ADD_POINTS_ID
         context.user_data["target_user_id"] = int(text)
         await update.message.reply_text("Enter points to add:")
+        return ADD_POINTS_AMT
+    if not text.isdigit():
+        await update.message.reply_text("❌ Enter a valid number:")
         return ADD_POINTS_AMT
     pts = int(text)
     uid = context.user_data.pop("target_user_id")
     update_user_points(uid, pts, f"Admin added {pts} points")
-    await update.message.reply_text(f"✅ Added {pts} points to user {uid}.")
+    await update.message.reply_text(f"✅ Added *{pts} points* to user {uid}.", parse_mode="Markdown")
     return ConversationHandler.END
+
 
 async def remove_points_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if "target_user_id" not in context.user_data:
+        if not text.isdigit():
+            await update.message.reply_text("❌ Enter a valid user ID:")
+            return REMOVE_POINTS_ID
         context.user_data["target_user_id"] = int(text)
         await update.message.reply_text("Enter points to remove:")
+        return REMOVE_POINTS_AMT
+    if not text.isdigit():
+        await update.message.reply_text("❌ Enter a valid number:")
         return REMOVE_POINTS_AMT
     pts = int(text)
     uid = context.user_data.pop("target_user_id")
     update_user_points(uid, -pts, f"Admin removed {pts} points", txn_type="deduct")
-    await update.message.reply_text(f"✅ Removed {pts} points from user {uid}.")
+    await update.message.reply_text(
+        f"✅ Removed *{pts} points* from user {uid}.", parse_mode="Markdown"
+    )
     return ConversationHandler.END
+
 
 # ---- SETTINGS INPUTS ----
 async def set_conversion_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1287,33 +1387,39 @@ async def set_conversion_input(update: Update, context: ContextTypes.DEFAULT_TYP
         pts, naira = int(parts[0]), int(parts[1])
         set_setting("points_per_conversion", str(pts))
         set_setting("naira_per_conversion", str(naira))
-        await update.message.reply_text(f"✅ Conversion set: {pts} pts = ₦{naira}")
-    except:
+        await update.message.reply_text(f"✅ Conversion set: *{pts} pts = ₦{naira}*", parse_mode="Markdown")
+    except Exception:
         await update.message.reply_text("❌ Invalid format. Use e.g. 1000:300")
     return ConversationHandler.END
+
 
 async def set_limit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.isdigit():
         set_setting("daily_limit_naira", text)
-        await update.message.reply_text(f"✅ Daily limit set to ₦{text}")
+        await update.message.reply_text(f"✅ Daily limit set to *₦{text}*", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Enter a valid number.")
     return ConversationHandler.END
+
 
 async def set_welcome_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("welcome_message", update.message.text.strip())
     await update.message.reply_text("✅ Welcome message updated.")
     return ConversationHandler.END
 
+
 async def set_referral_reward_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.isdigit():
         set_setting("referral_reward", text)
-        await update.message.reply_text(f"✅ Referral reward set to {text} points.")
+        await update.message.reply_text(
+            f"✅ Referral reward set to *{text} points*.", parse_mode="Markdown"
+        )
     else:
         await update.message.reply_text("❌ Enter a valid number.")
     return ConversationHandler.END
+
 
 # ============================================================
 # MAIN
@@ -1328,7 +1434,9 @@ def main():
         states={
             WITHDRAW_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_phone)],
             WITHDRAW_NETWORK: [CallbackQueryHandler(withdraw_network, pattern="^net_")],
-            WITHDRAW_CONFIRM: [CallbackQueryHandler(withdraw_confirm, pattern="^(confirm_withdraw|cancel_withdraw)$")],
+            WITHDRAW_CONFIRM: [CallbackQueryHandler(
+                withdraw_confirm, pattern="^(confirm_withdraw|cancel_withdraw)$"
+            )],
         },
         fallbacks=[CommandHandler("start", start)],
         per_user=True,
@@ -1360,7 +1468,9 @@ def main():
             SET_CONVERSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_conversion_input)],
             SET_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_limit_input)],
             SET_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_welcome_input)],
-            SET_REFERRAL_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_referral_reward_input)],
+            SET_REFERRAL_REWARD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_referral_reward_input)
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
         per_user=True,
@@ -1370,7 +1480,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(verify_channel, pattern="^verify_channel$"))
-    app.add_handler(CallbackQueryHandler(x_follow_opened, pattern="^x_follow_opened$"))
     app.add_handler(CallbackQueryHandler(x_follow_done, pattern="^x_follow_done$"))
     app.add_handler(CallbackQueryHandler(main_menu, pattern="^home$"))
     app.add_handler(CallbackQueryHandler(tasks_menu, pattern="^tasks$"))
@@ -1384,6 +1493,7 @@ def main():
 
     print("✅ Nexarion Rewards Bot is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
