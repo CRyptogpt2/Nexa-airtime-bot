@@ -350,7 +350,7 @@ async def verify_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Channel verified! You earned *{reward} points*.\n\nNext: Follow us on X.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🐦 Follow on X", https://x.com/Nexarion11, callback_data="x_follow_opened")],
+                    [InlineKeyboardButton("🐦 Follow on X", url=X_LINK, callback_data="x_follow_opened")],
                     [InlineKeyboardButton("✅ Done", callback_data="x_follow_done")]
                 ])
             )
