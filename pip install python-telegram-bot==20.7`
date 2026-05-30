@@ -1,3 +1,4 @@
+
 import sqlite3
 import logging
 import asyncio
@@ -8,7 +9,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 BOT_TOKEN = "8801665645:AAF9b_k_atpDWwZjuwNi8tx7WLLYH-xD9ME"
-BOT_USERNAME = Nexafreeairtimebot"" # Without @
+BOT_USERNAME = "Nexafreeairtimebot" # Without @
 ADMIN_IDS = [6326301165] # Replace with your Telegram user ID
 CHANNEL_ID = "https://t.me/nexarion11news" # Channel username or ID
 CHANNEL_LINK = "https://t.me/nexarion11news"
